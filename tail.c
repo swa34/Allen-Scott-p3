@@ -1,99 +1,108 @@
-#include<stdio.h>
-#include<stdlib.h>
-#include<string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
 
-#define DEFLINES 10 /* default # of lines to print */
-#define LINES   100 /* maximum # of lines to print */
-#define MAXLEN  100 /* maximum length of an input line */
+#define BUFSIZE 4096
+#define N_LINES 10
+#define TMPFILE "/tmp/stdin_tmpf.bin"
 
-void error(char *);
-int mgetline(char *,int);
-
-/* print the last n lines of the input */
-
-int main(int argc,char *argv[])
-{
-    char *p;
-    char *buf;  /* pointer to the large buffer */
-    char *bufend;   /* end of the large buffer */
-
-    char line[MAXLEN];
-    char *lineptr[LINES];   /* pointer to lines read */
-    
-    int first,i,last,len,n,nlines;
-
-    if( argc == 1)
-        n = DEFLINES;
-
-    else if(argc ==2 && (*++argv)[0] == '-')
-        n = atoi(argv[0]+1);
-    else
-        error("Usage: tail [-n]");
-
-    if( n < 1 || n > LINES)
-            n = LINES;
-
-    for(i = 0; i < LINES; i++)
-            lineptr[i] = NULL;
-
-    if(( p = buf = malloc(LINES * MAXLEN)) == NULL)
-        error("tail: cannot allocate buf");
-    bufend = buf + LINES + MAXLEN;
-
-    last = 0;
-    nlines = 0;
-
-    while((len = mgetline(line,MAXLEN)) > 0)
-    {
-        if(p+len+1 >= bufend)
-            p = buf;
-        lineptr[last] = p;
-
-        strcpy(lineptr[last],line);
-        if(++last >= LINES)
-            last = 0;
-
-        p += len + 1;
-        nlines++;
-    }
-
-    if( n > nlines)
-        n = nlines;
-
-    first = last - n;
-
-    if(first < 0)
-        first += LINES;
-    
-    for(i= first; n-- > 0;i = (i+1) % LINES)
-        printf("%s",lineptr[i]);
-
-    return 0;
+void oops(char *s1, char *s2) {
+  fprintf(stderr, "Error: %s\n(errno) ", s1);
+  perror(s2);
+  exit(1);
 }
 
-/* error: print error messages and exit */
+unsigned count_chars(const char *str, char byte, int n_chars) {
+  int cnt = 0;
+  for (int i = 0; i < n_chars; ++i)
+	if (str[i] == byte)
+	  ++cnt;
 
-void error(char *s)
-{
-    printf("%s\n",s);
-    exit(1);
+  return cnt;
 }
 
-/* mgetline: read a line into s and return length */
+unsigned find_cutoff(int fd) {
+  int linecnt, n_chars;
+  int subpos, block;
+  char cbuf[BUFSIZE];
+  subpos = block = linecnt = n_chars = 0;
 
-int mgetline(char s[],int lim)
-{
-    int c,i;
-    
-    for(i=0;i<lim-1 && (c=getchar())!=EOF && c!='\n';++i)
-        s[i] = c;
-    if ( c == '\n')
-    {
-        s[i] = c;
-        ++i;
-    }
+  // count lines to allocate linelocs array
+  while ((n_chars = read(fd, cbuf, BUFSIZE)) > 0)
+	linecnt += count_chars(cbuf, '\n', n_chars);
+  if (linecnt <= N_LINES)
+	return 0;
 
-    s[i] = '\0';
-    return i;
+  // array of positions of newlines
+  int linelocs[linecnt];
+  linelocs[0] = 0;
+  int loc_index = 0;
+
+  if (lseek(fd, 0, SEEK_SET) == -1)
+	oops("couldn't seek start", "");
+
+  while ((n_chars = read(fd, cbuf, BUFSIZE)) > 0) {
+	for (int i = 0; i < n_chars; ++i)
+	  if (cbuf[i] == '\n') {
+		loc_index++;
+		subpos = i+1;
+		linelocs[loc_index] = (BUFSIZE*block) + subpos;
+	  }
+
+	block++;
+  }
+
+  return linelocs[linecnt - N_LINES];
 }
 
+// create temporary file holding stdin contents
+int stdin_tmpf() {
+  int out_fd, in_fd;
+  int n_chars;
+  char buf[BUFSIZE];
+
+  if ((in_fd = fileno(stdin)) == -1)
+	oops("couldn't open stdin", "");
+  if ((out_fd = open(TMPFILE, O_RDWR | O_CREAT)) == -1)
+	oops("failed to create tmpf", "");
+  while ((n_chars = read(in_fd, buf, BUFSIZE)) > 0)
+	if (write(out_fd, buf, n_chars) != n_chars)
+	  oops("read/write error", "stdin_tmpf");
+
+  if (lseek(out_fd, 0, SEEK_SET) == -1)
+	oops("seek failure", "stdin_tmpf");
+  return out_fd;
+}
+
+int main(int argc, char **argv) {
+  int in_fd, out_fd;
+  bool cleanup = false;
+
+  if (argc == 1) {
+	in_fd = stdin_tmpf();
+	cleanup = true;
+  } else if ((in_fd = open(argv[1], O_RDONLY)) == -1)
+	oops("Couldn't open file", argv[1]);
+  if ((out_fd = fileno(stdout)) == -1)
+	oops("Couldn't open stdout", "");
+
+  unsigned cutoff = find_cutoff(in_fd);
+  int n_chars;
+  char buf[BUFSIZE];
+
+  if (lseek(in_fd, cutoff, SEEK_SET) == -1)
+	oops("couldn't seek cutoff", ""); // TODO int to str
+  while ((n_chars = read(in_fd, buf, BUFSIZE)) > 0)
+	if (write(out_fd, buf, n_chars) != n_chars)
+	  oops("couldn't write stdout", "");
+
+  if (close(in_fd) == -1 || close(out_fd) == -1)
+	oops("couldn't close files", "");
+  if (cleanup && unlink(TMPFILE) == -1)
+	oops("failed to cleanup", TMPFILE);
+
+  return 0;
+}
